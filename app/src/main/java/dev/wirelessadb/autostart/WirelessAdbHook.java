@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.UserManager;
 import android.provider.Settings;
 
@@ -27,7 +28,10 @@ import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
 import java.util.Collections;
 import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -50,6 +54,7 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
     private static final long REENABLE_COOLDOWN_MS = 8_000L;
     private static final long WIFI_RESTORE_DELAY_MS = 2_500L;
     private static final long ADDRESS_POLL_INTERVAL_MS = 2_500L;
+    private static final long CLIENT_POLL_INTERACTIVE_MS = 10_000L;
     private static final int ADDRESS_POLL_MAX = 12;
 
     private static Context systemContext;
@@ -62,6 +67,21 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
     private static String lastCopiedAddress;
     private static long lastEnableAt;
     private static final AtomicBoolean enableInFlight = new AtomicBoolean(false);
+    private static final Map<String, AdbClientMonitor.ClientEntry> activeClients = new LinkedHashMap<>();
+    private static final Map<String, Long> activeClientSince = new LinkedHashMap<>();
+    private static boolean initialClientScanDone;
+    private static boolean clientPollScheduled;
+
+    private static final Runnable clientPollRunnable = new Runnable() {
+        @Override public void run() {
+            clientPollScheduled = false;
+            if (!userUnlocked || systemContext == null) return;
+            syncActiveClients(false);
+            if (isScreenInteractive()) {
+                scheduleInteractiveClientPoll();
+            }
+        }
+    };
 
     /** Cached mode; refreshed from prefs on unlock / SET_MODE. */
     private static String cachedMode = AdbModeConfig.MODE_TLS;
@@ -102,6 +122,9 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
                         } else if (ACTION_APPLY.equals(action)) {
                             reloadConfig();
                             enableAdb("界面请求立即应用", true);
+                            syncActiveClients(true);
+                        } else if (AdbClientMonitor.ACTION_REFRESH_CLIENTS.equals(action)) {
+                            syncActiveClients(true);
                         }
                     });
                 }
@@ -110,6 +133,7 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
             filter.addAction(ACTION_REQUEST_COPY);
             filter.addAction(ACTION_SET_MODE);
             filter.addAction(ACTION_APPLY);
+            filter.addAction(AdbClientMonitor.ACTION_REFRESH_CLIENTS);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 systemContext.registerReceiver(receiver, filter,
                         IpcContract.CONTROL_PERMISSION, handler, Context.RECEIVER_EXPORTED);
@@ -253,6 +277,10 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
         log(reason + "，开始保持 ADB（" + AdbModeConfig.modeLabel(cachedMode) + "）");
         registerKeepers();
         enableAdb("首次解锁", true);
+        syncActiveClients(true);
+        if (isScreenInteractive()) {
+            scheduleInteractiveClientPoll();
+        }
     }
 
     private static void registerKeepers() {
@@ -305,7 +333,10 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
                 }
 
                 @Override public void onLost(Network network) {
-                    handler.post(() -> log("Wi-Fi 断开，等待恢复后再保持 ADB"));
+                    handler.post(() -> {
+                        log("Wi-Fi 断开，等待恢复后再保持 ADB");
+                        syncActiveClients(false);
+                    });
                 }
             });
             log("已注册 Wi-Fi 网络回调");
@@ -316,12 +347,25 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
 
     private static void registerScreenOnReceiver() {
         try {
+            IntentFilter screenFilter = new IntentFilter();
+            screenFilter.addAction(Intent.ACTION_SCREEN_ON);
+            screenFilter.addAction(Intent.ACTION_SCREEN_OFF);
             systemContext.registerReceiver(new BroadcastReceiver() {
                 @Override public void onReceive(Context context, Intent intent) {
-                    if (!userUnlocked) return;
-                    handler.postDelayed(() -> keepAlive("亮屏检查"), 1_000L);
+                    if (!userUnlocked || intent == null) return;
+                    String action = intent.getAction();
+                    if (Intent.ACTION_SCREEN_OFF.equals(action)) {
+                        stopInteractiveClientPoll();
+                        syncActiveClients(false);
+                    } else if (Intent.ACTION_SCREEN_ON.equals(action)) {
+                        handler.postDelayed(() -> {
+                            keepAlive("亮屏检查");
+                            syncActiveClients(false);
+                            scheduleInteractiveClientPoll();
+                        }, 1_000L);
+                    }
                 }
-            }, new IntentFilter(Intent.ACTION_SCREEN_ON));
+            }, screenFilter);
             log("已注册亮屏检查");
         } catch (Throwable t) {
             log("注册亮屏检查失败：" + shortError(t));
@@ -423,6 +467,7 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
             int port = resolveActivePort();
             if (ip != null && port > 0) {
                 waitForWeType(ip + ":" + port, forceCopy);
+                syncActiveClients(true);
             } else if (attempt < ADDRESS_POLL_MAX) {
                 if (attempt == 0 || attempt == 4 || attempt == 8) {
                     log("等待地址就绪（" + reason + "/" + cachedMode + "）：IP=" + ip
@@ -456,6 +501,98 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
     private static boolean isTcpPortReady(int expected) {
         int prop = getSystemPropertyInt(PROP_TCP_PORT, -1);
         return prop > 0 && (expected <= 0 || prop == expected);
+    }
+
+    private static void scheduleInteractiveClientPoll() {
+        if (handler == null || clientPollScheduled) return;
+        clientPollScheduled = true;
+        handler.postDelayed(clientPollRunnable, CLIENT_POLL_INTERACTIVE_MS);
+    }
+
+    private static void stopInteractiveClientPoll() {
+        if (handler == null) return;
+        handler.removeCallbacks(clientPollRunnable);
+        clientPollScheduled = false;
+    }
+
+    private static boolean isScreenInteractive() {
+        try {
+            PowerManager pm = systemContext.getSystemService(PowerManager.class);
+            return pm == null || pm.isInteractive();
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    private static void syncActiveClients(boolean forcePublish) {
+        if (systemContext == null) return;
+        try {
+            int tcpPort = getSystemPropertyInt(PROP_TCP_PORT, -1);
+            if (tcpPort <= 0 && AdbModeConfig.MODE_TCP.equals(cachedMode)) {
+                tcpPort = cachedTcpPort;
+            }
+            int tlsPort = getTlsPort();
+            long now = System.currentTimeMillis();
+
+            List<AdbClientMonitor.ClientEntry> scanned =
+                    AdbClientMonitor.scanProcNet(tcpPort, tlsPort, activeClientSince, now);
+
+            Map<String, AdbClientMonitor.ClientEntry> nextMap = new LinkedHashMap<>();
+            for (AdbClientMonitor.ClientEntry entry : scanned) {
+                nextMap.put(entry.key(), entry);
+            }
+
+            boolean changed = !nextMap.keySet().equals(activeClients.keySet());
+            if (!initialClientScanDone) {
+                initialClientScanDone = true;
+                for (AdbClientMonitor.ClientEntry entry : scanned) {
+                    activeClientSince.put(entry.key(), entry.connectedSinceMs);
+                }
+                activeClients.clear();
+                activeClients.putAll(nextMap);
+                AdbClientMonitor.writeGlobalSnapshot(systemContext, scanned, now);
+                if (!scanned.isEmpty()) {
+                    log("检测到在线客户端（" + scanned.size() + "）：" + summarizeClients(scanned));
+                }
+                return;
+            }
+
+            if (changed) {
+                for (Map.Entry<String, AdbClientMonitor.ClientEntry> entry : nextMap.entrySet()) {
+                    if (!activeClients.containsKey(entry.getKey())) {
+                        AdbClientMonitor.ClientEntry c = entry.getValue();
+                        activeClientSince.put(c.key(), c.connectedSinceMs);
+                        log("客户端连入：" + c.remoteEndpoint() + "（" + c.transport + " :" + c.localPort + "）");
+                    }
+                }
+                for (Map.Entry<String, AdbClientMonitor.ClientEntry> oldEntry : activeClients.entrySet()) {
+                    if (!nextMap.containsKey(oldEntry.getKey())) {
+                        AdbClientMonitor.ClientEntry c = oldEntry.getValue();
+                        activeClientSince.remove(c.key());
+                        log("客户端断开：" + c.remoteEndpoint() + "（" + c.transport + " :" + c.localPort + "）");
+                    }
+                }
+                activeClients.clear();
+                activeClients.putAll(nextMap);
+            }
+
+            if (changed || forcePublish) {
+                AdbClientMonitor.writeGlobalSnapshot(systemContext, scanned, now);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("WirelessAdbAutoStart client scan failed: " + shortError(t));
+        }
+    }
+
+    private static String summarizeClients(List<AdbClientMonitor.ClientEntry> list) {
+        StringBuilder sb = new StringBuilder();
+        int max = Math.min(list.size(), 3);
+        for (int i = 0; i < max; i++) {
+            if (i > 0) sb.append("、");
+            sb.append(list.get(i).remoteEndpoint());
+        }
+        if (list.size() > max) sb.append(" 等 ").append(list.size()).append(" 台");
+        return sb.toString();
     }
 
     private static void waitForWeType(String address, boolean forceCopy) {

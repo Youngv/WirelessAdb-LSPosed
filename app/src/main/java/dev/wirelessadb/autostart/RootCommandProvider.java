@@ -8,9 +8,12 @@ import android.os.Binder;
 import android.os.Bundle;
 import android.os.Process;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 
-/** Executes the small, fixed set of root operations requested by system_server. */
+/** Executes the small, fixed set of root operations requested by system_server or StatusActivity. */
 public final class RootCommandProvider extends ContentProvider {
     public static final String AUTHORITY = "dev.wirelessadb.autostart.root";
     public static final Uri URI = Uri.parse("content://" + AUTHORITY);
@@ -27,12 +30,28 @@ public final class RootCommandProvider extends ContentProvider {
             "su"
     };
 
+    static final class ExecResult {
+        final boolean invoked;
+        final int exitCode;
+        final String output;
+
+        ExecResult(boolean invoked, int exitCode, String output) {
+            this.invoked = invoked;
+            this.exitCode = exitCode;
+            this.output = output == null ? "" : output;
+        }
+
+        boolean isSuccess() {
+            return invoked && exitCode == 0;
+        }
+    }
+
     @Override public boolean onCreate() {
         return true;
     }
 
     @Override public Bundle call(String method, String arg, Bundle extras) {
-        if (Binder.getCallingUid() != android.os.Process.SYSTEM_UID) {
+        if (Binder.getCallingUid() != Process.SYSTEM_UID) {
             throw new SecurityException("Only system_server may request root operations");
         }
         Bundle result = new Bundle();
@@ -59,17 +78,44 @@ public final class RootCommandProvider extends ContentProvider {
 
     private static boolean setPropertyAsRoot(String key, String value) {
         String command = "setprop " + shellQuote(key) + " " + shellQuote(value);
+        return execRoot(command, 2_000L).isSuccess();
+    }
+
+    static ExecResult execRoot(String command, long timeoutMs) {
+        ExecResult lastAttempt = new ExecResult(false, -1, "");
         for (String executable : ROOT_EXECUTABLES) {
             java.lang.Process process = null;
             try {
                 process = new ProcessBuilder(executable, "-c", command)
                         .redirectErrorStream(true)
                         .start();
-                if (!process.waitFor(2, TimeUnit.SECONDS)) {
+                try { process.getOutputStream().close(); } catch (Throwable ignored) { }
+
+                final InputStream in = process.getInputStream();
+                final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                Thread reader = new Thread(() -> {
+                    byte[] chunk = new byte[4096];
+                    int read;
+                    try {
+                        while ((read = in.read(chunk)) != -1) {
+                            if (buffer.size() < 262_144) {
+                                buffer.write(chunk, 0, read);
+                            }
+                        }
+                    } catch (Throwable ignored) { }
+                }, "wadb-su-reader");
+                reader.setDaemon(true);
+                reader.start();
+
+                if (!process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
                     process.destroyForcibly();
                     continue;
                 }
-                if (process.exitValue() == 0) return true;
+                reader.join(300L);
+                int code = process.exitValue();
+                String out = new String(buffer.toByteArray(), StandardCharsets.UTF_8);
+                lastAttempt = new ExecResult(true, code, out);
+                if (code == 0) return lastAttempt;
             } catch (Throwable ignored) {
                 // Try the next known su location.
             } finally {
@@ -80,10 +126,10 @@ public final class RootCommandProvider extends ContentProvider {
                 }
             }
         }
-        return false;
+        return lastAttempt;
     }
 
-    private static String shellQuote(String value) {
+    static String shellQuote(String value) {
         return "'" + value.replace("'", "'\\''") + "'";
     }
 
