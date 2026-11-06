@@ -518,10 +518,14 @@ public final class StatusActivity extends Activity {
         String label = alias.isEmpty()
                 ? entry.remoteEndpoint()
                 : (alias + " (" + entry.remoteEndpoint() + ")");
+        boolean hookReady = AdbClientMonitor.readGlobalSnapshot(this).fromHook;
+        String msg = hookReady
+                ? ("强制关闭来自 " + label + " 的无线 ADB 会话吗？")
+                : ("强制关闭来自 " + label + " 的无线 ADB 会话吗？\n\n注：当前模块尚未重启生效，将尝试通过 Root 权限断开。");
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this)
                 .setTitle("断开客户端连接")
-                .setMessage("强制关闭来自 " + label + " 的无线 ADB 会话吗？\n\n注：强制踢下线需在 Root 管理器中授权本应用。")
+                .setMessage(msg)
                 .setNegativeButton("取消", null)
                 .setPositiveButton("断开此连接", (d, w) -> executeKick(entry, false));
 
@@ -534,14 +538,51 @@ public final class StatusActivity extends Activity {
 
     private void executeKick(AdbClientMonitor.ClientEntry entry, boolean allForIp) {
         setNotice("正在断开连接…");
+        final String target = allForIp ? entry.remoteIp : entry.remoteEndpoint();
+        final boolean hookReady = AdbClientMonitor.readGlobalSnapshot(this).fromHook;
+
+        if (hookReady) {
+            try {
+                sendBroadcast(new Intent(AdbClientMonitor.ACTION_DISCONNECT_CLIENT)
+                        .setPackage("android")
+                        .putExtra("ip", entry.remoteIp)
+                        .putExtra("remote_port", entry.remotePort)
+                        .putExtra("local_port", entry.localPort)
+                        .putExtra("all_for_ip", allForIp), IpcContract.CONTROL_PERMISSION);
+            } catch (Throwable ignored) { }
+        }
+
         bgExecutor.execute(() -> {
+            if (hookReady) {
+                try { Thread.sleep(380L); } catch (InterruptedException ignored) { }
+                AdbClientMonitor.Snapshot after = AdbClientMonitor.readGlobalSnapshot(this);
+                boolean stillConnected = false;
+                for (AdbClientMonitor.ClientEntry c : after.clients) {
+                    if (allForIp && entry.remoteIp.equals(c.remoteIp) && entry.localPort == c.localPort) {
+                        stillConnected = true;
+                        break;
+                    }
+                    if (!allForIp && entry.key().equals(c.key())) {
+                        stillConnected = true;
+                        break;
+                    }
+                }
+                if (!stillConnected) {
+                    uiHandler.post(() -> {
+                        if (isFinishing() || isDestroyed()) return;
+                        Toast.makeText(this, "已断开 " + target, Toast.LENGTH_SHORT).show();
+                        refreshAll("已断开 " + entry.remoteIp, false);
+                    });
+                    return;
+                }
+            }
+
             AdbClientMonitor.KickResult res = AdbClientMonitor.disconnectClientAsRoot(
                     entry.remoteIp, entry.remotePort, entry.localPort, allForIp);
             uiHandler.post(() -> {
                 if (isFinishing() || isDestroyed()) return;
                 if (res.success) {
                     rootFallbackAvailable = Boolean.TRUE;
-                    String target = allForIp ? entry.remoteIp : entry.remoteEndpoint();
                     String time = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA)
                             .format(new Date());
                     EventLog.append(this, time + "  手动断开客户端：" + target);

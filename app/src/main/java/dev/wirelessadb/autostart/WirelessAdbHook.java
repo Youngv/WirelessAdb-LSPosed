@@ -17,6 +17,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.UserManager;
@@ -59,6 +60,7 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
 
     private static Context systemContext;
     private static Handler handler;
+    private static Handler diagHandler;
     private static boolean armed;
     private static boolean keepersRegistered;
     private static boolean userUnlocked;
@@ -98,6 +100,7 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
                     armed = true;
                     try { systemContext = (Context) XposedHelpers.getObjectField(param.thisObject, "mContext"); }
                     catch (Throwable t) { log("获取系统上下文失败：" + shortError(t)); return; }
+                    initDiagWorker();
                     registerCommandReceivers();
                     waitForUnlock();
                 }
@@ -125,6 +128,8 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
                             syncActiveClients(true);
                         } else if (AdbClientMonitor.ACTION_REFRESH_CLIENTS.equals(action)) {
                             syncActiveClients(true);
+                        } else if (AdbClientMonitor.ACTION_DISCONNECT_CLIENT.equals(action)) {
+                            onDisconnectClient(intent);
                         }
                     });
                 }
@@ -134,6 +139,7 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
             filter.addAction(ACTION_SET_MODE);
             filter.addAction(ACTION_APPLY);
             filter.addAction(AdbClientMonitor.ACTION_REFRESH_CLIENTS);
+            filter.addAction(AdbClientMonitor.ACTION_DISCONNECT_CLIENT);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 systemContext.registerReceiver(receiver, filter,
                         IpcContract.CONTROL_PERMISSION, handler, Context.RECEIVER_EXPORTED);
@@ -498,6 +504,36 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
         return getTlsPort();
     }
 
+    private static void initDiagWorker() {
+        if (diagHandler != null) return;
+        try {
+            HandlerThread thread = new HandlerThread("wadb-netlink");
+            thread.setDaemon(true);
+            thread.start();
+            diagHandler = new Handler(thread.getLooper());
+        } catch (Throwable t) {
+            diagHandler = handler;
+        }
+    }
+
+    private static void onDisconnectClient(Intent intent) {
+        final String ip = intent.getStringExtra("ip");
+        final int remotePort = intent.getIntExtra("remote_port", -1);
+        final int localPort = intent.getIntExtra("local_port", -1);
+        final boolean allForIp = intent.getBooleanExtra("all_for_ip", false);
+        if (ip == null || ip.isEmpty() || localPort <= 0) return;
+
+        Handler runner = diagHandler != null ? diagHandler : handler;
+        runner.post(() -> {
+            int closed = AdbClientMonitor.disconnectViaSystemServer(ip, remotePort, localPort, allForIp);
+            if (closed > 0) {
+                String target = allForIp ? ip : (ip + ":" + remotePort);
+                log("已强制断开客户端：" + target + "（共 " + closed + " 条会话）");
+            }
+            syncActiveClientsNow(true);
+        });
+    }
+
     private static boolean isTcpPortReady(int expected) {
         int prop = getSystemPropertyInt(PROP_TCP_PORT, -1);
         return prop > 0 && (expected <= 0 || prop == expected);
@@ -525,6 +561,12 @@ public final class WirelessAdbHook implements IXposedHookLoadPackage {
     }
 
     private static void syncActiveClients(boolean forcePublish) {
+        Handler runner = diagHandler != null ? diagHandler : handler;
+        if (runner == null) return;
+        runner.post(() -> syncActiveClientsNow(forcePublish));
+    }
+
+    private static synchronized void syncActiveClientsNow(boolean forcePublish) {
         if (systemContext == null) return;
         try {
             int tcpPort = getSystemPropertyInt(PROP_TCP_PORT, -1);

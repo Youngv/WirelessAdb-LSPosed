@@ -31,6 +31,7 @@ import java.util.regex.Pattern;
  */
 public final class AdbClientMonitor {
     public static final String ACTION_REFRESH_CLIENTS = "dev.wirelessadb.autostart.REFRESH_CLIENTS";
+    public static final String ACTION_DISCONNECT_CLIENT = "dev.wirelessadb.autostart.DISCONNECT_CLIENT";
     public static final String GLOBAL_CLIENTS = "wirelessadb_autostart_clients";
     private static final String HEADER_PREFIX = "#v1\t";
     private static final String PREFS_ALIASES = "client_aliases";
@@ -91,13 +92,51 @@ public final class AdbClientMonitor {
 
     private AdbClientMonitor() {}
 
-    /** Scans /proc/net/tcp and /proc/net/tcp6 directly (callable from system_server). */
+    /**
+     * Scans active ADB sockets from system_server using NETLINK_INET_DIAG first
+     * (works rootlessly on Android 12–16+ despite SELinux proc_net_tcp_udp neverallow),
+     * with /proc/net/tcp* fallback for older kernels.
+     */
     public static List<ClientEntry> scanProcNet(int tcpPort, int tlsPort,
                                                 Map<String, Long> sinceTracker, long nowMs) {
         Map<String, ClientEntry> found = new LinkedHashMap<>();
-        scanFile("/proc/net/tcp", false, tcpPort, tlsPort, sinceTracker, nowMs, found);
-        scanFile("/proc/net/tcp6", true, tcpPort, tlsPort, sinceTracker, nowMs, found);
+        try {
+            List<InetDiagSocket.RawTcpSocket> diagSockets =
+                    InetDiagSocket.dumpEstablishedAdbSockets(tcpPort, tlsPort);
+            for (InetDiagSocket.RawTcpSocket s : diagSockets) {
+                boolean matchesTls = tlsPort > 0 && s.localPort == tlsPort;
+                boolean matchesTcp = tcpPort > 0 && s.localPort == tcpPort;
+                String transport = (matchesTls && !matchesTcp) ? "TLS" : "TCP";
+                String key = s.remoteIp + ":" + s.remotePort + "@" + s.localPort;
+                long since = nowMs;
+                if (sinceTracker != null) {
+                    Long existing = sinceTracker.get(key);
+                    if (existing != null && existing > 0L) since = existing;
+                }
+                if (!found.containsKey(key)) {
+                    found.put(key, new ClientEntry(s.remoteIp, s.remotePort, s.localPort, transport, since));
+                }
+            }
+        } catch (Throwable ignored) { }
+
+        if (found.isEmpty()) {
+            scanFile("/proc/net/tcp", false, tcpPort, tlsPort, sinceTracker, nowMs, found);
+            scanFile("/proc/net/tcp6", true, tcpPort, tlsPort, sinceTracker, nowMs, found);
+        }
         return sortClients(found.values());
+    }
+
+    /** Rootlessly destroys matching ADB client sockets from system_server via NETLINK_INET_DIAG SOCK_DESTROY. */
+    public static int disconnectViaSystemServer(String remoteIp, int remotePort,
+                                                int localPort, boolean allPortsForIp) {
+        if (remoteIp == null || !SAFE_IP.matcher(remoteIp).matches()) return 0;
+        if (localPort < 1 || localPort > 65535) return 0;
+        if (!allPortsForIp && (remotePort < 1 || remotePort > 65535)) return 0;
+        try {
+            return InetDiagSocket.destroyMatchingSockets(remoteIp, remotePort, localPort, allPortsForIp);
+        } catch (Throwable ignored) {
+            return 0;
+        }
     }
 
     /** Fallback scan via su when system_server hook has not been loaded yet. */

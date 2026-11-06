@@ -10,8 +10,8 @@ android {
         applicationId = "dev.wirelessadb.autostart"
         minSdk = 28
         targetSdk = 36
-        versionCode = 20
-        versionName = "1.1.0"
+        versionCode = 21
+        versionName = "1.1.1"
     }
 
     val keystorePath = System.getenv("SIGNING_STORE_FILE")
